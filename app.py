@@ -580,7 +580,7 @@ INDEX_TEMPLATE = """
       </section>
 
       <section class="composer">
-        <form method="post" action="/settings">
+        <form method="post" action="settings">
           <div class="composer-grid">
             <div>
               <label>HeartSmart Preview URL</label>
@@ -605,7 +605,7 @@ INDEX_TEMPLATE = """
           </div>
         </form>
 
-        <form method="post" action="/query">
+        <form method="post" action="query">
           <div class="composer-grid">
             <div>
               <label>Message</label>

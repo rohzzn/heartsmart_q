@@ -1,0 +1,18 @@
+services:
+  heartsmart-q:
+    container_name: heartsmart-q
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "15050:5050"
+    environment:
+      PORT: "5050"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      HEARTSMART_COOKIE_HEADER: ${HEARTSMART_COOKIE_HEADER:-}
+      HEARTSMART_API_BASE: ${HEARTSMART_API_BASE:-https://devheartsmart.pcgcid.org/api/v2/freeze-2025-05-06}
+      HEARTSMART_REFERER: ${HEARTSMART_REFERER:-https://devheartsmart.pcgcid.org/freeze-2025-05-06/results}
+      HEARTSMART_PREVIEW_PAGE_SIZE: ${HEARTSMART_PREVIEW_PAGE_SIZE:-38306}
+      HEARTSMART_API_TIMEOUT_SEC: ${HEARTSMART_API_TIMEOUT_SEC:-180}
+    restart: unless-stopped
