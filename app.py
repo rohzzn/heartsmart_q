@@ -6,7 +6,7 @@ import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import parse_qs, urlparse
 
-from flask import Flask, request, render_template_string
+from flask import Flask, jsonify, request, render_template_string
 import requests
 
 import parser as record_parser
@@ -160,11 +160,17 @@ def _apply_runtime_connection_settings(
     global _RUNTIME_API_BASE, _RUNTIME_PREVIEW_PATH, _RUNTIME_PREVIEW_PAGE_SIZE
     global _RUNTIME_REFERER, _RUNTIME_COOKIE_HEADER
 
-    api_base, preview_path, per_page = _parse_preview_url_config(preview_url)
-    next_cookie = (cookie_header or "").strip() or _RUNTIME_COOKIE_HEADER
-    next_referer = (referer or "").strip() or _RUNTIME_REFERER
-
     with _LOAD_LOCK:
+        if (preview_url or "").strip():
+            api_base, preview_path, per_page = _parse_preview_url_config(preview_url)
+        else:
+            api_base, preview_path, per_page = _RUNTIME_API_BASE, _RUNTIME_PREVIEW_PATH, _RUNTIME_PREVIEW_PAGE_SIZE
+
+        next_cookie = (cookie_header or "").strip() or _RUNTIME_COOKIE_HEADER
+        if not next_cookie:
+            raise ValueError("Cookie Header is required.")
+        next_referer = (referer or "").strip() or _RUNTIME_REFERER
+
         _RUNTIME_API_BASE = api_base
         _RUNTIME_PREVIEW_PATH = preview_path
         _RUNTIME_PREVIEW_PAGE_SIZE = per_page
@@ -210,12 +216,13 @@ INDEX_TEMPLATE = """
         background: radial-gradient(1100px 500px at -10% -30%, #2f3348 0%, transparent 55%), var(--bg);
       }
       .app {
-        max-width: 1200px;
-        margin: 0 auto;
+        width: 100%;
+        max-width: none;
+        margin: 0;
         min-height: 100vh;
-        padding: 14px 16px 24px;
+        padding: 14px 18px 24px;
         display: grid;
-        grid-template-rows: auto auto 1fr auto;
+        grid-template-rows: auto auto 1fr;
         gap: 12px;
       }
       .top {
@@ -246,6 +253,40 @@ INDEX_TEMPLATE = """
         color: var(--muted);
         background: #1b202d;
       }
+      .workspace {
+        display: grid;
+        grid-template-columns: 260px minmax(0, 1fr) 260px;
+        gap: 12px;
+        align-items: start;
+      }
+      .main-col {
+        min-width: 0;
+        display: grid;
+        gap: 12px;
+        align-content: start;
+      }
+      .side {
+        min-width: 0;
+      }
+      .side-card {
+        border: 1px solid var(--line);
+        background: rgba(27, 32, 45, 0.95);
+        border-radius: 14px;
+        padding: 12px;
+      }
+      .side-card h3 {
+        margin: 0 0 8px;
+        font-size: 14px;
+      }
+      .tips-list {
+        margin: 0;
+        padding-left: 16px;
+        display: grid;
+        gap: 8px;
+      }
+      .tips-list code {
+        color: #d7e1f6;
+      }
       .thread {
         border: 1px solid var(--line);
         background: var(--bg-soft);
@@ -254,6 +295,7 @@ INDEX_TEMPLATE = """
         display: grid;
         gap: 14px;
         align-content: start;
+        min-width: 0;
       }
       .msg {
         border: 1px solid var(--line);
@@ -269,6 +311,8 @@ INDEX_TEMPLATE = """
       }
       .msg.assistant {
         max-width: 100%;
+        min-width: 0;
+        overflow: hidden;
       }
       .msg h3 {
         margin: 0 0 8px;
@@ -281,10 +325,13 @@ INDEX_TEMPLATE = """
         white-space: pre-wrap;
       }
       .meta-grid {
-        margin-top: 10px;
+        margin: 10px 0;
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-        gap: 8px;
+        gap: 10px;
+      }
+      .assistant-meta {
+        margin: 10px 0 12px;
       }
       .meta-card {
         border: 1px solid #3a445a;
@@ -346,14 +393,19 @@ INDEX_TEMPLATE = """
         overflow: auto;
         color: #d5def2;
       }
-      .table-wrap {
-        border-top: 1px solid #394359;
+      .table-panel {
+        border: 1px solid #394359;
+        border-radius: 12px;
+        background: #151b26;
+        width: 100%;
+        min-width: 0;
         overflow: auto;
-        max-height: 70vh;
+        max-height: 60vh;
+        max-width: 100%;
       }
       table {
         width: max-content;
-        min-width: 100%;
+        min-width: max-content;
         border-collapse: collapse;
         table-layout: auto;
       }
@@ -382,6 +434,9 @@ INDEX_TEMPLATE = """
         background: rgba(27, 32, 45, 0.95);
         border-radius: 14px;
         padding: 12px;
+        position: sticky;
+        top: 10px;
+        z-index: 5;
       }
       .composer-grid {
         width: 100%;
@@ -399,7 +454,7 @@ INDEX_TEMPLATE = """
         letter-spacing: 0.03em;
         font-weight: 700;
       }
-      textarea, input[type="number"], input[type="text"] {
+      textarea, input[type="number"], input[type="text"], input[type="password"] {
         width: 100%;
         border: 1px solid #414b62;
         border-radius: 10px;
@@ -414,7 +469,7 @@ INDEX_TEMPLATE = """
         min-height: 90px;
         resize: vertical;
       }
-      textarea:focus, input[type="number"]:focus, input[type="text"]:focus {
+      textarea:focus, input[type="number"]:focus, input[type="text"]:focus, input[type="password"]:focus {
         border-color: #62d5b6;
         box-shadow: 0 0 0 3px rgba(98, 213, 182, 0.18);
       }
@@ -453,6 +508,11 @@ INDEX_TEMPLATE = """
         text-transform: uppercase;
         letter-spacing: 0.03em;
       }
+      @media (max-width: 1180px) {
+        .workspace {
+          grid-template-columns: 1fr;
+        }
+      }
       @media (max-width: 930px) {
         .composer-grid {
           grid-template-columns: 1fr;
@@ -469,7 +529,7 @@ INDEX_TEMPLATE = """
       <section class="meta">
         <div class="chip">Data Source: <code>{{ data_source }}</code></div>
         {% if load_status %}
-          <div class="chip">{{ load_status }}</div>
+          <div class="chip" id="load-status-chip">{{ load_status }}</div>
         {% endif %}
         {% if load_info %}
           <div class="chip">Loaded: {{ "%.2f"|format(load_info[0]) }}s</div>
@@ -478,177 +538,251 @@ INDEX_TEMPLATE = """
         <div class="chip">Max rows: {% if limit == 0 %}ALL{% else %}{{ limit }}{% endif %}</div>
       </section>
 
-      <section class="thread">
-        {% if q %}
-          <article class="msg user">
-            <p class="text">{{ q }}</p>
-          </article>
-        {% endif %}
-
-        {% if error %}
-          <article class="msg assistant">
-            <h3 class="danger">Error</h3>
-            <p class="text">{{ error }}</p>
-          </article>
-        {% endif %}
-
-        {% if settings_message %}
-          <article class="msg assistant">
-            <p class="text ok">{{ settings_message }}</p>
-          </article>
-        {% endif %}
-
-        {% if assistant_summary %}
-          <article class="msg assistant">
-            <p class="text">{{ assistant_summary }}</p>
-
-            {% if requested_collections or applied_collections or unavailable_collections or server_summary or notes %}
-              <div class="meta-grid">
-                {% if requested_collections %}
-                  <div class="meta-card">
-                    <h4>Requested</h4>
-                    <p>{{ requested_collections }}</p>
-                  </div>
-                {% endif %}
-                {% if applied_collections %}
-                  <div class="meta-card">
-                    <h4>Applied</h4>
-                    <p class="ok">{{ applied_collections }}</p>
-                  </div>
-                {% endif %}
-                {% if unavailable_collections %}
-                  <div class="meta-card">
-                    <h4>Not Applied</h4>
-                    <p class="danger">{{ unavailable_collections }}</p>
-                  </div>
-                {% endif %}
-                {% if server_summary %}
-                  <div class="meta-card">
-                    <h4>Server Summary</h4>
-                    <p>{{ server_summary }}</p>
-                  </div>
-                {% endif %}
-                {% if notes %}
-                  <div class="meta-card">
-                    <h4>Notes</h4>
-                    <p>{{ notes }}</p>
-                  </div>
-                {% endif %}
-              </div>
-            {% endif %}
-
-            {% if table_rows is not none %}
-              <details>
-                <summary>Show Full Table Response ({{ table_rows|length }} rows, {{ table_columns|length }} columns)</summary>
-                {% if table_rows|length == 0 %}
-                  <p class="text" style="padding: 10px 12px;">No rows matched.</p>
-                {% else %}
-                  <div class="table-wrap">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th style="width: 54px;">#</th>
-                          {% for c in table_columns %}
-                            <th>{{ c }}</th>
-                          {% endfor %}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {% for r in table_rows %}
-                          <tr>
-                            <td>{{ loop.index }}</td>
-                            {% for cell in r %}
-                              <td>{{ cell }}</td>
-                            {% endfor %}
-                          </tr>
-                        {% endfor %}
-                      </tbody>
-                    </table>
-                  </div>
-                {% endif %}
-              </details>
-            {% endif %}
-          </article>
-        {% endif %}
-
-        {% if not q %}
-          <article class="msg assistant">
-            <h3>How To Ask</h3>
-            <p class="text">Example: cpt and cmri_data subjects with Maternal Age greater than 20 and Cohort Source is Legacy.</p>
-          </article>
-        {% endif %}
-      </section>
-
-      <section class="composer">
-        <form method="post" action="settings">
-          <div class="composer-grid">
-            <div>
-              <label>HeartSmart Preview URL</label>
+      <section class="workspace">
+        <aside class="side">
+          <article class="side-card">
+            <h3>Connection</h3>
+            <form method="post" action="">
+              <label>Preview API URL</label>
               <input
                 type="text"
                 name="preview_url"
                 value="{{ preview_url or '' }}"
                 placeholder="https://.../query_tools/preview/?page=1&records_per_page=38306"
               />
-              <p class="composer-note">Paste the exact preview API URL.</p>
-            </div>
-            <div>
-              <label>Cookie Header</label>
-              <textarea name="cookie_header" placeholder="sessionid=...; cookie2=..."></textarea>
-              <p class="composer-note">Leave blank to keep current cookie.</p>
-            </div>
-            <div>
-              <label>Referer (optional)</label>
-              <input type="text" name="referer" value="{{ referer or '' }}" placeholder="https://.../results" />
-              <button type="submit">Update API Connection</button>
-            </div>
-          </div>
-        </form>
 
-        <form method="post" action="query">
-          <div class="composer-grid">
-            <div>
-              <label>Message</label>
-              <textarea name="q" placeholder="Describe the cohort and filters you want...">{{ q or "" }}</textarea>
-            </div>
-            <div>
-              <label>Max Results</label>
-              <input type="number" name="limit" min="0" max="200000" value="{{ limit if limit is not none else 0 }}" />
-              <p class="composer-note">Use 0 for all rows.</p>
-            </div>
-            <div>
-              <label>Run</label>
-              <button type="submit">Send</button>
-            </div>
-          </div>
-        </form>
-      </section>
+              <label style="margin-top: 10px;">Cookie Header</label>
+              <input
+                type="password"
+                name="cookie_header"
+                value=""
+                placeholder="Paste cookie header"
+                autocomplete="new-password"
+              />
+              <input type="hidden" name="referer" value="{{ referer or '' }}" />
 
-      <section class="dev-tools">
-        <details>
-          <summary>Developer Tools</summary>
-          <div class="dev-content">
-            {% if spec %}
-              <h4>Generated Filter Spec</h4>
-              <pre>{{ spec }}</pre>
+              <div style="margin-top: 10px;">
+                <button type="submit">Update API & Cookie</button>
+              </div>
+            </form>
+          </article>
+
+          <section class="dev-tools" style="margin-top: 12px;">
+            <details>
+              <summary>Developer Tools</summary>
+              <div class="dev-content">
+                {% if spec %}
+                  <h4>Generated Filter Spec</h4>
+                  <pre>{{ spec }}</pre>
+                {% endif %}
+                {% if query_to_run %}
+                  <h4>Query Debug</h4>
+                  <pre>{{ query_to_run }}</pre>
+                {% endif %}
+                <h4>Available Fields (sample)</h4>
+                <pre>{{ fields_preview }}</pre>
+              </div>
+            </details>
+          </section>
+        </aside>
+
+        <section class="main-col">
+          <section class="composer">
+            <form method="post" action="query">
+              <div class="composer-grid">
+                <div>
+                  <label>Message</label>
+                  <textarea name="q" placeholder="Describe the cohort and filters you want...">{{ q or "" }}</textarea>
+                </div>
+                <div>
+                  <label>Max Results</label>
+                  <input type="number" name="limit" min="0" max="200000" value="{{ limit if limit is not none else 0 }}" />
+                  <p class="composer-note">Use 0 for all rows.</p>
+                </div>
+                <div>
+                  <label>Run</label>
+                  <button type="submit">Send</button>
+                </div>
+              </div>
+            </form>
+          </section>
+
+          <section class="thread">
+            {% if q %}
+              <article class="msg user">
+                <p class="text">{{ q }}</p>
+              </article>
             {% endif %}
-            {% if query_to_run %}
-              <h4>Query Debug</h4>
-              <pre>{{ query_to_run }}</pre>
+
+            {% if error %}
+              <article class="msg assistant">
+                <h3 class="danger">Error</h3>
+                <p class="text">{{ error }}</p>
+              </article>
             {% endif %}
-            <h4>Available Fields (sample)</h4>
-            <pre>{{ fields_preview }}</pre>
-          </div>
-        </details>
+
+            <article class="msg assistant" id="live-load-error" style="display: none;">
+              <h3 class="danger">Error</h3>
+              <p class="text" id="live-load-error-text"></p>
+            </article>
+
+            {% if settings_message %}
+              <article class="msg assistant">
+                <p class="text ok">{{ settings_message }}</p>
+              </article>
+            {% endif %}
+
+            {% if assistant_summary %}
+              <article class="msg assistant">
+                <p class="text">{{ assistant_summary }}</p>
+
+                {% if requested_collections or applied_collections or unavailable_collections or server_summary or notes %}
+                  <div class="assistant-meta">
+                    <div class="meta-grid">
+                    {% if requested_collections %}
+                      <div class="meta-card">
+                        <h4>Requested</h4>
+                        <p>{{ requested_collections }}</p>
+                      </div>
+                    {% endif %}
+                    {% if applied_collections %}
+                      <div class="meta-card">
+                        <h4>Applied</h4>
+                        <p class="ok">{{ applied_collections }}</p>
+                      </div>
+                    {% endif %}
+                    {% if unavailable_collections %}
+                      <div class="meta-card">
+                        <h4>Not Applied</h4>
+                        <p class="danger">{{ unavailable_collections }}</p>
+                      </div>
+                    {% endif %}
+                    {% if server_summary %}
+                      <div class="meta-card">
+                        <h4>Server Summary</h4>
+                        <p>{{ server_summary }}</p>
+                      </div>
+                    {% endif %}
+                    {% if notes %}
+                      <div class="meta-card">
+                        <h4>Notes</h4>
+                        <p>{{ notes }}</p>
+                      </div>
+                    {% endif %}
+                    </div>
+                  </div>
+                {% endif %}
+
+                {% if table_rows is not none %}
+                  <details>
+                    <summary>Show Full Table Response ({{ table_rows|length }} rows, {{ table_columns|length }} columns)</summary>
+                    {% if table_rows|length == 0 %}
+                      <p class="text" style="padding: 10px 12px;">No rows matched.</p>
+                    {% else %}
+                      <div class="table-panel">
+                        <table>
+                          <thead>
+                            <tr>
+                              <th style="width: 54px;">#</th>
+                              {% for c in table_columns %}
+                                <th>{{ c }}</th>
+                              {% endfor %}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {% for r in table_rows %}
+                              <tr>
+                                <td>{{ loop.index }}</td>
+                                {% for cell in r %}
+                                  <td>{{ cell }}</td>
+                                {% endfor %}
+                              </tr>
+                            {% endfor %}
+                          </tbody>
+                        </table>
+                      </div>
+                    {% endif %}
+                  </details>
+                {% endif %}
+              </article>
+            {% endif %}
+
+          </section>
+
+        </section>
+
+        <aside class="side">
+          <article class="side-card">
+            <h3>Examples</h3>
+            <ul class="tips-list">
+              <li><code>How many people are in cpt with Maternal Age greater than 20?</code></li>
+              <li><code>Show emrdata_hpo subjects where Gender is Female.</code></li>
+              <li><code>Count people in labs with Cohort Source = Legacy.</code></li>
+              <li><code>Find subject 1-00079 in cmri_data.</code></li>
+              <li><code>Show rxnorm records for people older than 30.</code></li>
+              <li><code>List samples where DNA Sample Type contains blood.</code></li>
+            </ul>
+          </article>
+        </aside>
       </section>
     </main>
-    {% if load_status and not q %}
-      <script>
-        setTimeout(function () {
-          window.location.reload();
-        }, 4000);
-      </script>
-    {% endif %}
+    <script>
+      (function () {
+        const chip = document.getElementById("load-status-chip");
+        const liveErrorWrap = document.getElementById("live-load-error");
+        const liveErrorText = document.getElementById("live-load-error-text");
+        if (!chip && !liveErrorWrap) return;
+
+        let inFlight = false;
+        const poll = async function () {
+          if (inFlight) return;
+          inFlight = true;
+          try {
+            const resp = await fetch("load-status", { cache: "no-store" });
+            if (!resp.ok) return;
+            const data = await resp.json();
+            if (data.ready) {
+              if (chip && Array.isArray(data.load_info) && data.load_info.length >= 2) {
+                const sec = Number(data.load_info[0]);
+                const rows = data.load_info[1];
+                if (Number.isFinite(sec)) {
+                  chip.textContent = "Loaded in " + sec.toFixed(2) + "s (" + rows + " rows)";
+                } else {
+                  chip.textContent = "Loaded (" + rows + " rows)";
+                }
+              } else if (chip) {
+                chip.textContent = "Loaded";
+              }
+              if (liveErrorWrap) {
+                liveErrorWrap.style.display = "none";
+              }
+            } else if (typeof data.load_status === "string" && data.load_status.length > 0) {
+              if (chip) {
+                chip.textContent = data.load_status;
+              }
+              if (liveErrorWrap) {
+                liveErrorWrap.style.display = "none";
+              }
+            } else if (typeof data.error === "string" && data.error.length > 0) {
+              if (chip) {
+                chip.textContent = "Load error";
+              }
+              if (liveErrorWrap && liveErrorText) {
+                liveErrorText.textContent = data.error;
+                liveErrorWrap.style.display = "block";
+              }
+            }
+          } catch (_) {
+            // keep current UI state until next poll succeeds
+          } finally {
+            inFlight = false;
+          }
+        };
+
+        poll();
+        setInterval(poll, 3000);
+      })();
+    </script>
   </body>
 </html>
 """
@@ -1395,6 +1529,9 @@ def _ensure_background_data_load() -> None:
             return
         if _BACKGROUND_LOAD_THREAD is not None and _BACKGROUND_LOAD_THREAD.is_alive():
             return
+        # Keep surfaced errors visible instead of endlessly restarting failed loads.
+        if _BACKGROUND_LOAD_ERROR:
+            return
         _BACKGROUND_LOAD_ERROR = None
         _BACKGROUND_LOAD_STARTED_AT = time.time()
         _BACKGROUND_LOAD_THREAD = threading.Thread(
@@ -1628,22 +1765,23 @@ def call_openai_for_spec(nl_query: str, fields: List[str]) -> Tuple[Dict[str, An
     return spec, notes if isinstance(notes, str) else None, sorted(set(collections))
 
 
-@app.post("/settings")
-def update_settings():
-    preview_url = (request.form.get("preview_url") or "").strip()
-    cookie_header = (request.form.get("cookie_header") or "").strip()
-    referer = (request.form.get("referer") or "").strip()
-
+@app.route("/", methods=["GET", "POST"])
+def index():
     settings_message: Optional[str] = None
-    error: Optional[str] = None
-    try:
-        _apply_runtime_connection_settings(preview_url=preview_url, cookie_header=cookie_header, referer=referer)
-        _ensure_background_data_load()
-        settings_message = "API connection updated. Loading data in background."
-    except Exception as exc:
-        error = str(exc)
+    settings_error: Optional[str] = None
+    if request.method == "POST":
+        preview_url = (request.form.get("preview_url") or "").strip()
+        cookie_header = (request.form.get("cookie_header") or "").strip()
+        referer = (request.form.get("referer") or "").strip()
+        try:
+            _apply_runtime_connection_settings(preview_url=preview_url, cookie_header=cookie_header, referer=referer)
+            settings_message = "API connection updated. Loading data in background."
+        except Exception as exc:
+            settings_error = str(exc)
 
+    _ensure_background_data_load()
     _, load_status, load_error, fields, info = _load_state_snapshot()
+    error = settings_error or load_error
     fields_preview = _fields_preview_text(fields)
     return render_template_string(
         INDEX_TEMPLATE,
@@ -1652,41 +1790,6 @@ def update_settings():
         preview_url=_runtime_preview_url_for_form(),
         referer=_RUNTIME_REFERER,
         settings_message=settings_message,
-        load_status=load_status,
-        load_info=info,
-        q="",
-        limit=0,
-        spec=None,
-        notes=None,
-        table_columns=None,
-        table_rows=None,
-        columns_truncated=False,
-        matched_count=None,
-        error=error or load_error,
-        requested_collections=None,
-        applied_collections=None,
-        unavailable_collections=None,
-        server_summary=None,
-        assistant_summary=None,
-        person_details=None,
-        query_to_run=None,
-        fields_preview=fields_preview,
-    )
-
-
-@app.get("/")
-def index():
-    _ensure_background_data_load()
-    _, load_status, load_error, fields, info = _load_state_snapshot()
-    error = load_error
-    fields_preview = _fields_preview_text(fields)
-    return render_template_string(
-        INDEX_TEMPLATE,
-        title=APP_TITLE,
-        data_source=_runtime_data_source_label(),
-        preview_url=_runtime_preview_url_for_form(),
-        referer=_RUNTIME_REFERER,
-        settings_message=None,
         load_status=load_status,
         load_info=info,
         q="",
@@ -1706,6 +1809,20 @@ def index():
         person_details=None,
         query_to_run=None,
         fields_preview=fields_preview,
+    )
+
+
+@app.get("/load-status")
+def load_status():
+    _ensure_background_data_load()
+    ready, status_text, load_error, _, info = _load_state_snapshot()
+    return jsonify(
+        {
+            "ready": ready,
+            "load_status": status_text,
+            "error": load_error,
+            "load_info": list(info) if info is not None else None,
+        }
     )
 
 
@@ -1845,7 +1962,7 @@ def query():
                 if _is_auth_error(remote_err):
                     raise RuntimeError(
                         "HeartSmart session is unauthorized (401/403), so collection filters cannot be applied. "
-                        "Update Cookie Header using 'Update API Connection' on this page and run the query again."
+                        "Update Cookie Header in the left Connection panel and run the query again."
                     )
                 # Fallback to local heuristic behavior if remote API call fails.
                 matched = record_parser.filter_rows(data, spec)
