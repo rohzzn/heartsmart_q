@@ -26,14 +26,55 @@ def get_by_path(obj: Dict[str, Any], path: str) -> Any:
     return cur
 
 
+def _norm_str(x: Any) -> str:
+    return str(x).strip().lower()
+
+
+def _canonical_gender_token(x: Any) -> Optional[str]:
+    if not isinstance(x, str):
+        return None
+    token = re.sub(r"[^a-z]+", "", x.lower())
+    if token in {"m", "male", "males", "man", "men"}:
+        return "male"
+    if token in {"f", "female", "females", "woman", "women"}:
+        return "female"
+    return None
+
+
+def _text_equal(a: Any, b: Any) -> bool:
+    ga = _canonical_gender_token(a)
+    gb = _canonical_gender_token(b)
+    if ga is not None and gb is not None:
+        return ga == gb
+    if isinstance(a, str) and isinstance(b, str):
+        return _norm_str(a) == _norm_str(b)
+    return a == b
+
+
 def coerce_number(x: Any) -> Optional[float]:
     if isinstance(x, (int, float)):
         return float(x)
     if isinstance(x, str):
         s = x.strip()
+        if not s:
+            return None
+        s_clean = s.replace(",", "")
         try:
-            return float(s)
+            return float(s_clean)
         except ValueError:
+            # Age-like strings are common, e.g. "20 years, 196 days".
+            m_years = re.search(r"([-+]?\d+(?:\.\d+)?)\s*years?\b", s_clean, flags=re.IGNORECASE)
+            if m_years:
+                try:
+                    return float(m_years.group(1))
+                except ValueError:
+                    pass
+            m_any = re.search(r"[-+]?\d+(?:\.\d+)?", s_clean)
+            if m_any:
+                try:
+                    return float(m_any.group(0))
+                except ValueError:
+                    return None
             return None
     return None
 
@@ -58,13 +99,21 @@ def match_condition(value: Any, cond: Dict[str, Any]) -> bool:
         return value is None
 
     if op == "eq":
-        return value == expected
+        return _text_equal(value, expected)
     if op == "ne":
-        return value != expected
+        return not _text_equal(value, expected)
     if op == "in":
-        return value in (expected or [])
+        if not isinstance(expected, list):
+            return False
+        if isinstance(value, str):
+            return any(_text_equal(value, item) for item in expected)
+        return value in expected
     if op == "nin":
-        return value not in (expected or [])
+        if not isinstance(expected, list):
+            return True
+        if isinstance(value, str):
+            return all(not _text_equal(value, item) for item in expected)
+        return value not in expected
 
     # string-ish operators
     if op in {"contains", "startswith", "endswith", "regex"}:
@@ -72,15 +121,20 @@ def match_condition(value: Any, cond: Dict[str, Any]) -> bool:
             return False
         s = str(value)
         t = "" if expected is None else str(expected)
+        s_fold = s.lower()
+        t_fold = t.lower()
 
         if op == "contains":
-            return t in s
+            return t_fold in s_fold
         if op == "startswith":
-            return s.startswith(t)
+            return s_fold.startswith(t_fold)
         if op == "endswith":
-            return s.endswith(t)
+            return s_fold.endswith(t_fold)
         if op == "regex":
-            return re.search(t, s) is not None
+            try:
+                return re.search(t, s, flags=re.IGNORECASE) is not None
+            except re.error:
+                return False
 
     # numeric comparisons (best effort)
     if op in {"gt", "gte", "lt", "lte"}:

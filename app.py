@@ -1397,33 +1397,340 @@ def _preferred_id_field_from_fields(fields: List[str]) -> Optional[str]:
     return _preferred_id_field_from_keys(set(fields))
 
 
+def _dedupe_preserve_order(values: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for v in values:
+        key = (v or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def extract_subject_id_tokens(nl_query: str, max_range_size: int = 2000) -> List[str]:
+    """
+    Extracts one or more subject IDs from query text, including ranges like:
+    "1-00079 to 1-00098"
+    """
+    text = nl_query or ""
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    range_pattern = re.compile(
+        r"\b(\d{1,4})-(\d{3,})\s*(?:to|through|thru|-)\s*(\d{1,4})-(\d{3,})\b",
+        flags=re.IGNORECASE,
+    )
+    for m in range_pattern.finditer(text):
+        left_prefix, left_num, right_prefix, right_num = m.group(1), m.group(2), m.group(3), m.group(4)
+        if left_prefix == right_prefix:
+            start = int(left_num)
+            end = int(right_num)
+            if end >= start and (end - start + 1) <= max_range_size:
+                width = max(len(left_num), len(right_num))
+                for n in range(start, end + 1):
+                    token = f"{left_prefix}-{n:0{width}d}"
+                    if token not in seen:
+                        seen.add(token)
+                        out.append(token)
+                continue
+        # If prefixes differ or range is too large, keep explicit endpoints.
+        for token in (f"{left_prefix}-{left_num}", f"{right_prefix}-{right_num}"):
+            if token not in seen:
+                seen.add(token)
+                out.append(token)
+
+    for prefix, num in re.findall(r"\b(\d{1,4})-(\d{3,})\b", text):
+        token = f"{prefix}-{num}"
+        if token not in seen:
+            seen.add(token)
+            out.append(token)
+
+    return out
+
+
 def extract_subject_id_token(nl_query: str) -> Optional[str]:
-    # HeartSmart IDs are usually shaped like "1-00079".
-    m = re.search(r"\b\d{1,4}-\d{3,}\b", nl_query or "")
-    return m.group(0) if m else None
+    ids = extract_subject_id_tokens(nl_query)
+    return ids[0] if ids else None
+
+
+def _remove_field_constraints(spec: Dict[str, Any], field_name: str) -> Dict[str, Any]:
+    def walk(node: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(node, dict):
+            return None
+        if "and" in node and isinstance(node["and"], list):
+            children: List[Dict[str, Any]] = []
+            for ch in node["and"]:
+                out = walk(ch)
+                if out is not None:
+                    children.append(out)
+            return {"and": children}
+        if "or" in node and isinstance(node["or"], list):
+            children = []
+            for ch in node["or"]:
+                out = walk(ch)
+                if out is not None:
+                    children.append(out)
+            if not children:
+                return None
+            return {"or": children}
+        if "not" in node:
+            inner = walk(node["not"])
+            if inner is None:
+                return None
+            return {"not": inner}
+        if node.get("field") == field_name:
+            return None
+        return dict(node)
+
+    cleaned = walk(spec)
+    return cleaned if cleaned is not None else {"and": []}
+
+
+def add_subject_id_constraints(spec: Dict[str, Any], id_field: str, subject_ids: List[str]) -> Dict[str, Any]:
+    ids = _dedupe_preserve_order([_cell_text(v).strip() for v in subject_ids])
+    if not ids:
+        return spec
+
+    # Remove model-generated ID constraints and replace with deterministic ones from user text.
+    cleaned = _remove_field_constraints(spec, id_field)
+    wanted: Dict[str, Any]
+    if len(ids) == 1:
+        wanted = {"field": id_field, "op": "eq", "value": ids[0]}
+    else:
+        wanted = {"field": id_field, "op": "in", "value": ids}
+
+    if isinstance(cleaned, dict) and "and" in cleaned and isinstance(cleaned["and"], list):
+        return {"and": [*cleaned["and"], wanted]}
+    return {"and": [cleaned, wanted]}
 
 
 def add_subject_id_constraint(spec: Dict[str, Any], id_field: str, subject_id: str) -> Dict[str, Any]:
-    wanted = {"field": id_field, "op": "eq", "value": subject_id}
+    return add_subject_id_constraints(spec, id_field, [subject_id])
 
-    def has_wanted(node: Any) -> bool:
+
+def _canonical_gender_word(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    token = re.sub(r"[^a-z]+", "", value.lower())
+    if token in {"m", "male", "males", "man", "men"}:
+        return "male"
+    if token in {"f", "female", "females", "woman", "women"}:
+        return "female"
+    return None
+
+
+def _gender_variants(gender: str) -> List[str]:
+    if gender == "male":
+        return ["M", "Male", "male", "m", "MALE"]
+    if gender == "female":
+        return ["F", "Female", "female", "f", "FEMALE"]
+    return []
+
+
+def _is_gender_field(field_name: Any) -> bool:
+    if not isinstance(field_name, str):
+        return False
+    norm = _normalize_for_match(field_name)
+    return ("gender" in norm) or (re.search(r"\bsex\b", norm) is not None)
+
+
+def _rewrite_gender_conditions(spec: Dict[str, Any]) -> Dict[str, Any]:
+    def walk(node: Any) -> Any:
+        if not isinstance(node, dict):
+            return node
+        if "and" in node and isinstance(node["and"], list):
+            return {"and": [walk(ch) for ch in node["and"]]}
+        if "or" in node and isinstance(node["or"], list):
+            return {"or": [walk(ch) for ch in node["or"]]}
+        if "not" in node:
+            return {"not": walk(node["not"])}
+
+        out = dict(node)
+        if not _is_gender_field(out.get("field")):
+            return out
+
+        op = out.get("op")
+        value = out.get("value")
+
+        if op in {"eq", "ne"}:
+            canonical = _canonical_gender_word(value)
+            if canonical:
+                variants = _gender_variants(canonical)
+                out["op"] = "in" if op == "eq" else "nin"
+                out["value"] = variants
+            return out
+
+        if op in {"in", "nin"} and isinstance(value, list):
+            expanded: List[str] = []
+            for item in value:
+                canonical = _canonical_gender_word(item)
+                if canonical:
+                    expanded.extend(_gender_variants(canonical))
+                elif isinstance(item, str):
+                    expanded.append(item)
+            out["value"] = _dedupe_preserve_order(expanded) if expanded else value
+            return out
+
+        return out
+
+    rewritten = walk(spec)
+    return rewritten if isinstance(rewritten, dict) else spec
+
+
+def _extract_age_hint_from_query(nl_query: str) -> Optional[Tuple[str, float]]:
+    q = (nl_query or "").lower()
+    if "age" not in q:
+        return None
+
+    patterns: List[Tuple[str, str]] = [
+        (r"\b(?:older than|greater than|more than|over)\s+(\d+(?:\.\d+)?)\b", "gt"),
+        (r"\b(?:older than|greater than|more than|over)\s+(?:the\s+)?(?:age\s*(?:of)?\s+)?(\d+(?:\.\d+)?)\b", "gt"),
+        (r"\b(?:at least|minimum(?: of)?|no less than)\s+(\d+(?:\.\d+)?)\b", "gte"),
+        (r"\b(?:at least|minimum(?: of)?|no less than)\s+(?:the\s+)?(?:age\s*(?:of)?\s+)?(\d+(?:\.\d+)?)\b", "gte"),
+        (r"\b(?:younger than|less than|under|below)\s+(?:the\s+age\s+of\s+)?(\d+(?:\.\d+)?)\b", "lt"),
+        (r"\b(?:younger than|less than|under|below)\s+(?:the\s+)?(?:age\s*(?:of)?\s+)?(\d+(?:\.\d+)?)\b", "lt"),
+        (r"\b(?:at most|maximum(?: of)?|no more than)\s+(\d+(?:\.\d+)?)\b", "lte"),
+        (r"\b(?:at most|maximum(?: of)?|no more than)\s+(?:the\s+)?(?:age\s*(?:of)?\s+)?(\d+(?:\.\d+)?)\b", "lte"),
+        (r"\bage\s+(?:older than|greater than|more than|over)\s+(\d+(?:\.\d+)?)\b", "gt"),
+        (r"\bage\s+(?:younger than|less than|under|below)\s+(\d+(?:\.\d+)?)\b", "lt"),
+        (r"\bage\s*(?:>=|=>)\s*(\d+(?:\.\d+)?)\b", "gte"),
+        (r"\bage\s*(?:<=|=<)\s*(\d+(?:\.\d+)?)\b", "lte"),
+        (r"\bage\s*>\s*(\d+(?:\.\d+)?)\b", "gt"),
+        (r"\bage\s*<\s*(\d+(?:\.\d+)?)\b", "lt"),
+    ]
+    for pattern, op in patterns:
+        m = re.search(pattern, q)
+        if not m:
+            continue
+        try:
+            return op, float(m.group(1))
+        except ValueError:
+            continue
+    return None
+
+
+def _find_best_age_field(fields: List[str], nl_query: str) -> Optional[str]:
+    q = (nl_query or "").lower()
+    age_fields = [f for f in fields if "age" in f.lower()]
+    if not age_fields:
+        return None
+
+    lowered = {f.lower(): f for f in age_fields}
+    if "maternal" in q and "maternal age" in lowered:
+        return lowered["maternal age"]
+    if "paternal" in q and "paternal age" in lowered:
+        return lowered["paternal age"]
+    if "age" in lowered:
+        return lowered["age"]
+    if "maternal age" in lowered:
+        return lowered["maternal age"]
+    if "paternal age" in lowered:
+        return lowered["paternal age"]
+    return sorted(age_fields, key=lambda f: (len(f), f.lower()))[0]
+
+
+def _spec_has_age_condition(spec: Dict[str, Any]) -> bool:
+    def walk(node: Any) -> bool:
         if not isinstance(node, dict):
             return False
-        if node.get("field") == id_field and node.get("op") == "eq":
-            return _cell_text(node.get("value")).strip() == subject_id
         if "and" in node and isinstance(node["and"], list):
-            return any(has_wanted(ch) for ch in node["and"])
+            return any(walk(ch) for ch in node["and"])
         if "or" in node and isinstance(node["or"], list):
-            return any(has_wanted(ch) for ch in node["or"])
+            return any(walk(ch) for ch in node["or"])
         if "not" in node:
-            return has_wanted(node["not"])
-        return False
+            return walk(node["not"])
+        field = node.get("field")
+        return isinstance(field, str) and ("age" in field.lower())
 
-    if has_wanted(spec):
+    return walk(spec)
+
+
+def _extract_gender_hint_from_query(nl_query: str) -> Optional[str]:
+    q = (nl_query or "").lower()
+    has_male = re.search(r"\b(male|males|man|men)\b", q) is not None
+    has_female = re.search(r"\b(female|females|woman|women)\b", q) is not None
+    if has_male and not has_female:
+        return "male"
+    if has_female and not has_male:
+        return "female"
+    return None
+
+
+def _find_best_gender_field(fields: List[str]) -> Optional[str]:
+    candidates = [f for f in fields if _is_gender_field(f)]
+    if not candidates:
+        return None
+    lowered = {f.lower(): f for f in candidates}
+    if "gender" in lowered:
+        return lowered["gender"]
+    if "sex" in lowered:
+        return lowered["sex"]
+    return sorted(candidates, key=lambda f: (len(f), f.lower()))[0]
+
+
+def _spec_has_gender_condition(spec: Dict[str, Any]) -> bool:
+    def walk(node: Any) -> bool:
+        if not isinstance(node, dict):
+            return False
+        if "and" in node and isinstance(node["and"], list):
+            return any(walk(ch) for ch in node["and"])
+        if "or" in node and isinstance(node["or"], list):
+            return any(walk(ch) for ch in node["or"])
+        if "not" in node:
+            return walk(node["not"])
+        return _is_gender_field(node.get("field"))
+
+    return walk(spec)
+
+
+def _inject_gender_hint_condition(spec: Dict[str, Any], nl_query: str, fields: List[str]) -> Dict[str, Any]:
+    if _spec_has_gender_condition(spec):
         return spec
+    hint = _extract_gender_hint_from_query(nl_query)
+    if not hint:
+        return spec
+    gender_field = _find_best_gender_field(fields)
+    if not gender_field:
+        return spec
+    wanted = {"field": gender_field, "op": "in", "value": _gender_variants(hint)}
     if isinstance(spec, dict) and "and" in spec and isinstance(spec["and"], list):
         return {"and": [*spec["and"], wanted]}
     return {"and": [spec, wanted]}
+
+
+def _inject_age_hint_condition(spec: Dict[str, Any], nl_query: str, fields: List[str]) -> Dict[str, Any]:
+    hint = _extract_age_hint_from_query(nl_query)
+    if not hint:
+        return spec
+    if _spec_has_age_condition(spec):
+        return spec
+
+    age_field = _find_best_age_field(fields, nl_query)
+    if not age_field:
+        return spec
+
+    op, value = hint
+    wanted = {"field": age_field, "op": op, "value": value}
+    if isinstance(spec, dict) and "and" in spec and isinstance(spec["and"], list):
+        return {"and": [*spec["and"], wanted]}
+    return {"and": [spec, wanted]}
+
+
+def _postprocess_spec_for_query(
+    spec: Dict[str, Any],
+    nl_query: str,
+    fields: List[str],
+    id_field: Optional[str],
+) -> Dict[str, Any]:
+    out = _rewrite_gender_conditions(spec)
+    out = _inject_gender_hint_condition(out, nl_query, fields)
+    out = _inject_age_hint_condition(out, nl_query, fields)
+    subject_ids = extract_subject_id_tokens(nl_query)
+    if subject_ids and id_field:
+        out = add_subject_id_constraints(out, id_field, subject_ids)
+    return out
 
 
 def _count_unique_people(rows: List[JsonObj]) -> Optional[int]:
@@ -1519,29 +1826,54 @@ def build_assistant_summary(
     unique_people = _count_unique_people(rows)
     people_count = unique_people if unique_people is not None else matched_count
 
-    subject_id = extract_subject_id_token(nl_query)
+    subject_ids = extract_subject_id_tokens(nl_query)
     id_field = _preferred_id_field(rows)
-    if subject_id and id_field:
-        row = next(
-            (
-                r
-                for r in rows
-                if isinstance(r, dict) and _cell_text(r.get(id_field)).strip() == subject_id
-            ),
-            None,
-        )
-        if row:
-            row_count_for_subject = sum(
-                1
-                for r in rows
-                if isinstance(r, dict) and _cell_text(r.get(id_field)).strip() == subject_id
+    if subject_ids and id_field:
+        wanted = set(subject_ids)
+        matched_ids_ordered: List[str] = []
+        seen_ids: Set[str] = set()
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            sid = _cell_text(r.get(id_field)).strip()
+            if sid and sid in wanted and sid not in seen_ids:
+                seen_ids.add(sid)
+                matched_ids_ordered.append(sid)
+
+        if len(subject_ids) == 1:
+            subject_id = subject_ids[0]
+            row = next(
+                (
+                    r
+                    for r in rows
+                    if isinstance(r, dict) and _cell_text(r.get(id_field)).strip() == subject_id
+                ),
+                None,
             )
-            detail_pairs = _meaningful_row_pairs(row, max_items=8)
-            details = ", ".join(detail_pairs) if detail_pairs else "No additional populated fields were found."
-            msg = f"I found subject {subject_id} in {collection_text}."
-            if row_count_for_subject > 1:
-                msg += f" There are {row_count_for_subject} matching rows for this subject."
-            msg += f" {details}"
+            if row:
+                row_count_for_subject = sum(
+                    1
+                    for r in rows
+                    if isinstance(r, dict) and _cell_text(r.get(id_field)).strip() == subject_id
+                )
+                detail_pairs = _meaningful_row_pairs(row, max_items=8)
+                details = ", ".join(detail_pairs) if detail_pairs else "No additional populated fields were found."
+                msg = f"I found subject {subject_id} in {collection_text}."
+                if row_count_for_subject > 1:
+                    msg += f" There are {row_count_for_subject} matching rows for this subject."
+                msg += f" {details}"
+                if unavailable_collections:
+                    msg += f" Some requested collections were not applied: {unavailable_text}."
+                return msg
+        elif matched_ids_ordered:
+            found_n = len(matched_ids_ordered)
+            requested_n = len(subject_ids)
+            msg = f"I found {found_n} of {requested_n} requested subjects in {collection_text}."
+            if found_n <= 20:
+                msg += f" Matched IDs: {', '.join(matched_ids_ordered)}."
+            else:
+                preview = ", ".join(matched_ids_ordered[:20])
+                msg += f" First matched IDs: {preview}."
             if unavailable_collections:
                 msg += f" Some requested collections were not applied: {unavailable_text}."
             return msg
@@ -1767,6 +2099,8 @@ RULES:
 - Use ONLY the provided field names exactly as written (case/spacing).
 - Prefer "and" to combine multiple constraints.
 - If the user asks for "age" without clarifying, pick the most explicit matching field name; add a brief note in "notes".
+- Treat "male/female/males/females" as gender values and map them to the best gender field (e.g., "Gender").
+- For age comparisons, assume age values can be strings like "20 years, 196 days"; still output numeric thresholds (e.g., 20, 30).
 - If the user asks for site-level collection filters (example: Labs, RxNorm, emrdata_hpo), do not turn those into field conditions.
 - Put those collection filters in "collections" as a list of collection permanent_id values.
 - If no field constraint is requested, use {{"and": []}} for "spec".
@@ -1782,6 +2116,7 @@ RULES:
   - "contains"/"includes" -> contains
   - "starts with" -> startswith
   - "ends with" -> endswith
+- If the user asks for a subject ID range (example "1-00079 to 1-00098"), represent it as an "in" condition on the subject ID field with all IDs in the inclusive range.
 
 {parser_code}
 
@@ -2004,10 +2339,13 @@ def query():
 
     try:
         spec, notes, llm_collections = call_openai_for_spec(nl_query, fields)
-        subject_id_token = extract_subject_id_token(nl_query)
         id_field_for_query = _preferred_id_field_from_fields(fields)
-        if subject_id_token and id_field_for_query:
-            spec = add_subject_id_constraint(spec, id_field_for_query, subject_id_token)
+        spec = _postprocess_spec_for_query(
+            spec=spec,
+            nl_query=nl_query,
+            fields=fields,
+            id_field=id_field_for_query,
+        )
         validate_spec(spec, allowed_fields)
 
         extracted_collections = extract_collection_filters_from_text(nl_query)
