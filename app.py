@@ -4,6 +4,7 @@ import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from urllib.parse import parse_qs, urlparse
 
 from flask import Flask, request, render_template_string
 import requests
@@ -75,10 +76,6 @@ try:
     HEARTSMART_API_TIMEOUT_SEC = max(30, int(os.environ.get("HEARTSMART_API_TIMEOUT_SEC", "180")))
 except ValueError:
     HEARTSMART_API_TIMEOUT_SEC = 180
-PREVIEW_DATA_URL = f"{HEARTSMART_API_BASE}{PREVIEW_ENDPOINT_PATH}"
-DATA_SOURCE_LABEL = (
-    f"{PREVIEW_DATA_URL}?page=1&records_per_page={HEARTSMART_PREVIEW_PAGE_SIZE}"
-)
 
 
 app = Flask(__name__)
@@ -90,6 +87,95 @@ _LOAD_LOCK = threading.Lock()
 _BACKGROUND_LOAD_THREAD: Optional[threading.Thread] = None
 _BACKGROUND_LOAD_STARTED_AT: Optional[float] = None
 _BACKGROUND_LOAD_ERROR: Optional[str] = None
+_RUNTIME_API_BASE = HEARTSMART_API_BASE
+_RUNTIME_PREVIEW_PATH = PREVIEW_ENDPOINT_PATH
+_RUNTIME_PREVIEW_PAGE_SIZE = HEARTSMART_PREVIEW_PAGE_SIZE
+_RUNTIME_REFERER = HEARTSMART_REFERER
+_RUNTIME_COOKIE_HEADER = (os.getenv("HEARTSMART_COOKIE_HEADER", "") or "").strip()
+
+
+def _runtime_data_source_label() -> str:
+    return (
+        f"{_RUNTIME_API_BASE}{_RUNTIME_PREVIEW_PATH}"
+        f"?page=1&records_per_page={_RUNTIME_PREVIEW_PAGE_SIZE}"
+    )
+
+
+def _runtime_preview_url_for_form() -> str:
+    return _runtime_data_source_label()
+
+
+def _clear_runtime_cache_unlocked() -> None:
+    global _DATA_CACHE, _FIELDS_CACHE, _LOAD_INFO
+    global _BACKGROUND_LOAD_THREAD, _BACKGROUND_LOAD_STARTED_AT, _BACKGROUND_LOAD_ERROR
+    _DATA_CACHE = None
+    _FIELDS_CACHE = None
+    _LOAD_INFO = None
+    _BACKGROUND_LOAD_THREAD = None
+    _BACKGROUND_LOAD_STARTED_AT = None
+    _BACKGROUND_LOAD_ERROR = None
+
+
+def _parse_preview_url_config(preview_url: str) -> Tuple[str, str, int]:
+    raw = (preview_url or "").strip()
+    if not raw:
+        raise ValueError("Preview URL is required.")
+
+    parsed = urlparse(raw)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError("Preview URL must include protocol and host.")
+
+    marker = "/query_tools/preview"
+    path = parsed.path or ""
+    idx = path.find(marker)
+    if idx < 0:
+        raise ValueError("Preview URL must include '/query_tools/preview'.")
+
+    api_path = path[:idx].rstrip("/")
+    if not api_path:
+        raise ValueError("Preview URL is missing the API base path before '/query_tools/preview'.")
+
+    preview_path = path[idx:]
+    if not preview_path.endswith("/"):
+        preview_path += "/"
+
+    api_base = f"{parsed.scheme}://{parsed.netloc}{api_path}".rstrip("/")
+    params = parse_qs(parsed.query or "")
+    per_page = _RUNTIME_PREVIEW_PAGE_SIZE
+    raw_per_page = (params.get("records_per_page") or [None])[0]
+    if raw_per_page is not None and str(raw_per_page).strip():
+        try:
+            per_page = max(1, int(str(raw_per_page).strip()))
+        except ValueError as exc:
+            raise ValueError("records_per_page in Preview URL must be a positive integer.") from exc
+
+    return api_base, preview_path, per_page
+
+
+def _apply_runtime_connection_settings(
+    preview_url: str,
+    cookie_header: str,
+    referer: str,
+) -> None:
+    global _RUNTIME_API_BASE, _RUNTIME_PREVIEW_PATH, _RUNTIME_PREVIEW_PAGE_SIZE
+    global _RUNTIME_REFERER, _RUNTIME_COOKIE_HEADER
+
+    api_base, preview_path, per_page = _parse_preview_url_config(preview_url)
+    next_cookie = (cookie_header or "").strip() or _RUNTIME_COOKIE_HEADER
+    next_referer = (referer or "").strip() or _RUNTIME_REFERER
+
+    with _LOAD_LOCK:
+        _RUNTIME_API_BASE = api_base
+        _RUNTIME_PREVIEW_PATH = preview_path
+        _RUNTIME_PREVIEW_PAGE_SIZE = per_page
+        _RUNTIME_REFERER = next_referer
+        _RUNTIME_COOKIE_HEADER = next_cookie
+        _clear_runtime_cache_unlocked()
+
+    os.environ["HEARTSMART_API_BASE"] = _RUNTIME_API_BASE
+    os.environ["HEARTSMART_REFERER"] = _RUNTIME_REFERER
+    os.environ["HEARTSMART_PREVIEW_PAGE_SIZE"] = str(_RUNTIME_PREVIEW_PAGE_SIZE)
+    os.environ["HEARTSMART_COOKIE_HEADER"] = _RUNTIME_COOKIE_HEADER
 
 
 INDEX_TEMPLATE = """
@@ -313,7 +399,7 @@ INDEX_TEMPLATE = """
         letter-spacing: 0.03em;
         font-weight: 700;
       }
-      textarea, input[type="number"] {
+      textarea, input[type="number"], input[type="text"] {
         width: 100%;
         border: 1px solid #414b62;
         border-radius: 10px;
@@ -328,7 +414,7 @@ INDEX_TEMPLATE = """
         min-height: 90px;
         resize: vertical;
       }
-      textarea:focus, input[type="number"]:focus {
+      textarea:focus, input[type="number"]:focus, input[type="text"]:focus {
         border-color: #62d5b6;
         box-shadow: 0 0 0 3px rgba(98, 213, 182, 0.18);
       }
@@ -403,6 +489,12 @@ INDEX_TEMPLATE = """
           <article class="msg assistant">
             <h3 class="danger">Error</h3>
             <p class="text">{{ error }}</p>
+          </article>
+        {% endif %}
+
+        {% if settings_message %}
+          <article class="msg assistant">
+            <p class="text ok">{{ settings_message }}</p>
           </article>
         {% endif %}
 
@@ -488,6 +580,31 @@ INDEX_TEMPLATE = """
       </section>
 
       <section class="composer">
+        <form method="post" action="/settings">
+          <div class="composer-grid">
+            <div>
+              <label>HeartSmart Preview URL</label>
+              <input
+                type="text"
+                name="preview_url"
+                value="{{ preview_url or '' }}"
+                placeholder="https://.../query_tools/preview/?page=1&records_per_page=38306"
+              />
+              <p class="composer-note">Paste the exact preview API URL.</p>
+            </div>
+            <div>
+              <label>Cookie Header</label>
+              <textarea name="cookie_header" placeholder="sessionid=...; cookie2=..."></textarea>
+              <p class="composer-note">Leave blank to keep current cookie.</p>
+            </div>
+            <div>
+              <label>Referer (optional)</label>
+              <input type="text" name="referer" value="{{ referer or '' }}" placeholder="https://.../results" />
+              <button type="submit">Update API Connection</button>
+            </div>
+          </div>
+        </form>
+
         <form method="post" action="/query">
           <div class="composer-grid">
             <div>
@@ -777,7 +894,7 @@ def _parse_cookie_header(cookie_header_value: str) -> Dict[str, str]:
 
 
 def _heartsmart_session() -> requests.Session:
-    cookie_header = (os.getenv("HEARTSMART_COOKIE_HEADER", "") or "").strip()
+    cookie_header = (_RUNTIME_COOKIE_HEADER or "").strip()
     cookies = _parse_cookie_header(cookie_header)
     if not cookies:
         raise RuntimeError("HEARTSMART_COOKIE_HEADER is missing; cannot call live HeartSmart API.")
@@ -787,7 +904,7 @@ def _heartsmart_session() -> requests.Session:
         {
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "Referer": HEARTSMART_REFERER,
+            "Referer": _RUNTIME_REFERER,
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
@@ -799,14 +916,14 @@ def _heartsmart_session() -> requests.Session:
 
 
 def _api_get(session: requests.Session, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    url = f"{HEARTSMART_API_BASE}{path}"
+    url = f"{_RUNTIME_API_BASE}{path}"
     r = session.get(url, params=params, timeout=HEARTSMART_API_TIMEOUT_SEC)
     r.raise_for_status()
     return r.json()
 
 
 def _api_post(session: requests.Session, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{HEARTSMART_API_BASE}{path}"
+    url = f"{_RUNTIME_API_BASE}{path}"
     r = session.post(url, json=payload, timeout=HEARTSMART_API_TIMEOUT_SEC)
     r.raise_for_status()
     return r.json()
@@ -840,9 +957,10 @@ def _preview_payload_to_rows(payload: Dict[str, Any]) -> List[JsonObj]:
 
 def _fetch_preview_all_rows(
     session: requests.Session,
-    per_page: int = HEARTSMART_PREVIEW_PAGE_SIZE,
+    per_page: Optional[int] = None,
 ) -> Tuple[List[JsonObj], Dict[str, Any]]:
-    first = _api_get(session, PREVIEW_ENDPOINT_PATH, params={"page": 1, "records_per_page": per_page})
+    fetch_page_size = per_page if isinstance(per_page, int) and per_page > 0 else _RUNTIME_PREVIEW_PAGE_SIZE
+    first = _api_get(session, _RUNTIME_PREVIEW_PATH, params={"page": 1, "records_per_page": fetch_page_size})
     all_rows = _preview_payload_to_rows(first)
 
     paginator = first.get("paginator", {}) if isinstance(first.get("paginator"), dict) else {}
@@ -851,7 +969,7 @@ def _fetch_preview_all_rows(
         last_page = 1
 
     for page in range(2, last_page + 1):
-        nxt = _api_get(session, PREVIEW_ENDPOINT_PATH, params={"page": page, "records_per_page": per_page})
+        nxt = _api_get(session, _RUNTIME_PREVIEW_PATH, params={"page": page, "records_per_page": fetch_page_size})
         all_rows.extend(_preview_payload_to_rows(nxt))
 
     meta = {
@@ -1317,10 +1435,10 @@ def load_data_once() -> Tuple[JsonObj, List[str], Tuple[float, int]]:
         clear_errors = clear_resp.get("errors") if isinstance(clear_resp, dict) else None
         if clear_errors:
             raise RuntimeError(f"Failed to clear cohort filters before preview load: {clear_errors}")
-        rows, meta = _fetch_preview_all_rows(session, per_page=HEARTSMART_PREVIEW_PAGE_SIZE)
+        rows, meta = _fetch_preview_all_rows(session, per_page=_RUNTIME_PREVIEW_PAGE_SIZE)
         data: JsonObj = {
             "rows_as_objects": rows,
-            "source": DATA_SOURCE_LABEL,
+            "source": _runtime_data_source_label(),
             "meta": meta,
         }
         fields: List[str] = []
@@ -1510,6 +1628,52 @@ def call_openai_for_spec(nl_query: str, fields: List[str]) -> Tuple[Dict[str, An
     return spec, notes if isinstance(notes, str) else None, sorted(set(collections))
 
 
+@app.post("/settings")
+def update_settings():
+    preview_url = (request.form.get("preview_url") or "").strip()
+    cookie_header = (request.form.get("cookie_header") or "").strip()
+    referer = (request.form.get("referer") or "").strip()
+
+    settings_message: Optional[str] = None
+    error: Optional[str] = None
+    try:
+        _apply_runtime_connection_settings(preview_url=preview_url, cookie_header=cookie_header, referer=referer)
+        _ensure_background_data_load()
+        settings_message = "API connection updated. Loading data in background."
+    except Exception as exc:
+        error = str(exc)
+
+    _, load_status, load_error, fields, info = _load_state_snapshot()
+    fields_preview = _fields_preview_text(fields)
+    return render_template_string(
+        INDEX_TEMPLATE,
+        title=APP_TITLE,
+        data_source=_runtime_data_source_label(),
+        preview_url=_runtime_preview_url_for_form(),
+        referer=_RUNTIME_REFERER,
+        settings_message=settings_message,
+        load_status=load_status,
+        load_info=info,
+        q="",
+        limit=0,
+        spec=None,
+        notes=None,
+        table_columns=None,
+        table_rows=None,
+        columns_truncated=False,
+        matched_count=None,
+        error=error or load_error,
+        requested_collections=None,
+        applied_collections=None,
+        unavailable_collections=None,
+        server_summary=None,
+        assistant_summary=None,
+        person_details=None,
+        query_to_run=None,
+        fields_preview=fields_preview,
+    )
+
+
 @app.get("/")
 def index():
     _ensure_background_data_load()
@@ -1519,7 +1683,10 @@ def index():
     return render_template_string(
         INDEX_TEMPLATE,
         title=APP_TITLE,
-        data_source=DATA_SOURCE_LABEL,
+        data_source=_runtime_data_source_label(),
+        preview_url=_runtime_preview_url_for_form(),
+        referer=_RUNTIME_REFERER,
+        settings_message=None,
         load_status=load_status,
         load_info=info,
         q="",
@@ -1563,7 +1730,10 @@ def query():
         return render_template_string(
             INDEX_TEMPLATE,
             title=APP_TITLE,
-            data_source=DATA_SOURCE_LABEL,
+            data_source=_runtime_data_source_label(),
+            preview_url=_runtime_preview_url_for_form(),
+            referer=_RUNTIME_REFERER,
+            settings_message=None,
             load_status=load_status,
             load_info=None,
             q=nl_query,
@@ -1591,7 +1761,10 @@ def query():
         return render_template_string(
             INDEX_TEMPLATE,
             title=APP_TITLE,
-            data_source=DATA_SOURCE_LABEL,
+            data_source=_runtime_data_source_label(),
+            preview_url=_runtime_preview_url_for_form(),
+            referer=_RUNTIME_REFERER,
+            settings_message=None,
             load_status=None,
             load_info=None,
             q=nl_query,
@@ -1620,7 +1793,11 @@ def query():
         return render_template_string(
             INDEX_TEMPLATE,
             title=APP_TITLE,
-            data_source=DATA_SOURCE_LABEL,
+            data_source=_runtime_data_source_label(),
+            preview_url=_runtime_preview_url_for_form(),
+            referer=_RUNTIME_REFERER,
+            settings_message=None,
+            load_status=None,
             load_info=info,
             q=nl_query,
             limit=limit,
@@ -1668,7 +1845,7 @@ def query():
                 if _is_auth_error(remote_err):
                     raise RuntimeError(
                         "HeartSmart session is unauthorized (401/403), so collection filters cannot be applied. "
-                        "Update HEARTSMART_COOKIE_HEADER in /Users/pot95a/Projects/heartsmart_q/.env, restart the app, and run the query again."
+                        "Update Cookie Header using 'Update API Connection' on this page and run the query again."
                     )
                 # Fallback to local heuristic behavior if remote API call fails.
                 matched = record_parser.filter_rows(data, spec)
@@ -1710,7 +1887,11 @@ def query():
         return render_template_string(
             INDEX_TEMPLATE,
             title=APP_TITLE,
-            data_source=DATA_SOURCE_LABEL,
+            data_source=_runtime_data_source_label(),
+            preview_url=_runtime_preview_url_for_form(),
+            referer=_RUNTIME_REFERER,
+            settings_message=None,
+            load_status=None,
             load_info=info,
             q=nl_query,
             limit=limit,
@@ -1740,7 +1921,11 @@ def query():
         return render_template_string(
             INDEX_TEMPLATE,
             title=APP_TITLE,
-            data_source=DATA_SOURCE_LABEL,
+            data_source=_runtime_data_source_label(),
+            preview_url=_runtime_preview_url_for_form(),
+            referer=_RUNTIME_REFERER,
+            settings_message=None,
+            load_status=None,
             load_info=info,
             q=nl_query,
             limit=limit,
