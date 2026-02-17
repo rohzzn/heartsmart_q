@@ -152,6 +152,49 @@ def _parse_preview_url_config(preview_url: str) -> Tuple[str, str, int]:
     return api_base, preview_path, per_page
 
 
+def _normalize_cookie_header(cookie_header_value: str) -> str:
+    """
+    Accepts raw cookie text pasted from browser/network tools and normalizes it.
+    """
+    raw = (cookie_header_value or "").strip()
+    if not raw:
+        return ""
+
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+        raw = raw[1:-1].strip()
+
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+
+    chosen = ""
+    for idx, ln in enumerate(lines):
+        lower = ln.lower()
+        if lower.startswith("cookie:"):
+            chosen = ln.split(":", 1)[1].strip()
+            break
+        if lower == "cookie" and (idx + 1) < len(lines):
+            chosen = lines[idx + 1].strip()
+            break
+        if lower.startswith("cookie "):
+            parts = ln.split(None, 1)
+            if len(parts) == 2:
+                chosen = parts[1].strip()
+                break
+    if not chosen:
+        if len(lines) > 1:
+            candidates = [ln for ln in lines if ("=" in ln and ";" in ln)]
+            chosen = max(candidates, key=len) if candidates else lines[0]
+        else:
+            chosen = lines[0]
+        if chosen.lower().startswith("cookie:"):
+            chosen = chosen.split(":", 1)[1].strip()
+
+    chosen = chosen.strip().strip(";")
+    chosen = re.sub(r"\s*;\s*", "; ", chosen)
+    return chosen
+
+
 def _apply_runtime_connection_settings(
     preview_url: str,
     cookie_header: str,
@@ -166,7 +209,7 @@ def _apply_runtime_connection_settings(
         else:
             api_base, preview_path, per_page = _RUNTIME_API_BASE, _RUNTIME_PREVIEW_PATH, _RUNTIME_PREVIEW_PAGE_SIZE
 
-        next_cookie = (cookie_header or "").strip() or _RUNTIME_COOKIE_HEADER
+        next_cookie = _normalize_cookie_header(cookie_header) or _RUNTIME_COOKIE_HEADER
         if not next_cookie:
             raise ValueError("Cookie Header is required.")
         next_referer = (referer or "").strip() or _RUNTIME_REFERER
@@ -1015,7 +1058,7 @@ def apply_collection_filters(
 
 def _parse_cookie_header(cookie_header_value: str) -> Dict[str, str]:
     cookies: Dict[str, str] = {}
-    for part in (cookie_header_value or "").split(";"):
+    for part in _normalize_cookie_header(cookie_header_value).split(";"):
         part = part.strip()
         if not part or "=" not in part:
             continue
@@ -1028,9 +1071,9 @@ def _parse_cookie_header(cookie_header_value: str) -> Dict[str, str]:
 
 
 def _heartsmart_session() -> requests.Session:
-    cookie_header = (_RUNTIME_COOKIE_HEADER or "").strip()
+    cookie_header = _normalize_cookie_header(_RUNTIME_COOKIE_HEADER)
     cookies = _parse_cookie_header(cookie_header)
-    if not cookies:
+    if not cookies and "=" not in cookie_header:
         raise RuntimeError("HEARTSMART_COOKIE_HEADER is missing; cannot call live HeartSmart API.")
 
     s = requests.Session()
@@ -1045,13 +1088,24 @@ def _heartsmart_session() -> requests.Session:
             ),
         }
     )
-    s.cookies.update(cookies)
+    if cookies:
+        s.cookies.update(cookies)
+    s.headers["X-Requested-With"] = "XMLHttpRequest"
     return s
 
 
 def _api_get(session: requests.Session, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     url = f"{_RUNTIME_API_BASE}{path}"
     r = session.get(url, params=params, timeout=HEARTSMART_API_TIMEOUT_SEC)
+    if r.status_code in {401, 403}:
+        raw_cookie = _normalize_cookie_header(_RUNTIME_COOKIE_HEADER)
+        if raw_cookie:
+            r = session.get(
+                url,
+                params=params,
+                timeout=HEARTSMART_API_TIMEOUT_SEC,
+                headers={"Cookie": raw_cookie, "Referer": _RUNTIME_REFERER},
+            )
     r.raise_for_status()
     return r.json()
 
@@ -1059,6 +1113,15 @@ def _api_get(session: requests.Session, path: str, params: Optional[Dict[str, An
 def _api_post(session: requests.Session, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{_RUNTIME_API_BASE}{path}"
     r = session.post(url, json=payload, timeout=HEARTSMART_API_TIMEOUT_SEC)
+    if r.status_code in {401, 403}:
+        raw_cookie = _normalize_cookie_header(_RUNTIME_COOKIE_HEADER)
+        if raw_cookie:
+            r = session.post(
+                url,
+                json=payload,
+                timeout=HEARTSMART_API_TIMEOUT_SEC,
+                headers={"Cookie": raw_cookie, "Referer": _RUNTIME_REFERER},
+            )
     r.raise_for_status()
     return r.json()
 
@@ -1567,11 +1630,15 @@ def load_data_once() -> Tuple[JsonObj, List[str], Tuple[float, int]]:
 
         t0 = time.time()
         session = _heartsmart_session()
-        # Ensure base preview load is unscoped by leftover cohort criteria.
-        clear_resp = _api_post(session, "/cohort_def/", {"transformation": {"type": "clear_all"}})
-        clear_errors = clear_resp.get("errors") if isinstance(clear_resp, dict) else None
-        if clear_errors:
-            raise RuntimeError(f"Failed to clear cohort filters before preview load: {clear_errors}")
+        # Best effort only; preview reads can still work even when cohort_def is unauthorized.
+        try:
+            clear_resp = _api_post(session, "/cohort_def/", {"transformation": {"type": "clear_all"}})
+            clear_errors = clear_resp.get("errors") if isinstance(clear_resp, dict) else None
+            if clear_errors:
+                raise RuntimeError(f"Failed to clear cohort filters before preview load: {clear_errors}")
+        except Exception as exc:
+            if not _is_auth_error(exc):
+                raise
         rows, meta = _fetch_preview_all_rows(session, per_page=_RUNTIME_PREVIEW_PAGE_SIZE)
         data: JsonObj = {
             "rows_as_objects": rows,
@@ -1959,11 +2026,6 @@ def query():
                     f"record_count={remote_meta.get('record_count')}"
                 )
             except Exception as remote_err:
-                if _is_auth_error(remote_err):
-                    raise RuntimeError(
-                        "HeartSmart session is unauthorized (401/403), so collection filters cannot be applied. "
-                        "Update Cookie Header in the left Connection panel and run the query again."
-                    )
                 # Fallback to local heuristic behavior if remote API call fails.
                 matched = record_parser.filter_rows(data, spec)
                 matched, applied_collections, unavailable_collections = apply_collection_filters(
@@ -1971,11 +2033,17 @@ def query():
                     requested_collections,
                     fields,
                 )
-                extra = (
-                    "Remote cohort API unavailable; used local heuristic fallback. "
-                    "Collection scoping may be incomplete. "
-                    f"Error: {remote_err}"
-                )
+                if _is_auth_error(remote_err):
+                    extra = (
+                        "Remote cohort API returned 401/403; used local fallback for collection filters. "
+                        "Collection scoping may be incomplete. Update Cookie Header and retry."
+                    )
+                else:
+                    extra = (
+                        "Remote cohort API unavailable; used local heuristic fallback. "
+                        "Collection scoping may be incomplete. "
+                        f"Error: {remote_err}"
+                    )
                 notes = f"{notes} | {extra}" if notes else extra
                 server_summary = "Remote cohort API call failed; fallback mode used."
         else:
